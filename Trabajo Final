@@ -1,0 +1,214 @@
+/* Programación con Arduino Nano: Gorra inteligente diseñada para asistir a personas con discapacidad visual. 
+La gorra utiliza sensores ultrasónicos y un sensor láser VL53L0X para detectar obstáculos, 
+escaleras, paredes y desniveles, proporcionando retroalimentación sensorial a través de 
+vibraciones y sonidos que ayudan al usuario a navegar con mayor seguridad.
+ */
+
+#include <Wire.h>         // Librería para comunicación I2C (usada por el sensor láser)
+#include <VL53L0X.h>      // Librería para el sensor láser de distancia VL53L0X
+
+#define TRIG_IZQ 4        // Pin de disparo del sensor ultrasónico izquierdo
+#define ECHO_IZQ 5        // Pin de recepción del sensor ultrasónico izquierdo
+#define TRIG_DER 2        // Pin de disparo del sensor ultrasónico derecho
+#define ECHO_DER 3        // Pin de recepción del sensor ultrasónico derecho
+#define VIBRADOR_IZQ 6    // Pin de salida para el vibrador izquierdo
+#define VIBRADOR_DER 7    // Pin de salida para el vibrador derecho
+#define BUZZER 8          // Pin de salida para el buzzer (alerta sonora)
+
+#define UMBRAL_ALERTA_SUAVE 100       // Distancia para alerta suave
+#define UMBRAL_ALERTA_MEDIA 60        // Distancia para alerta media
+#define UMBRAL_PELIGRO 30             // Distancia para alerta de peligro
+#define DISTANCIA_MAXIMA_VALIDA 200   // Lectura máxima válida
+#define DISTANCIA_MINIMA_VALIDA 2     // Lectura mínima válida
+
+int distanciaIzq = 0;       // Distancia medida por el sensor izquierdo
+int distanciaDer = 0;       // Distancia medida por el sensor derecho
+int distanciaFrontal = 0;   // Distancia medida por el sensor láser frontal
+
+int lecturasValidas = 0;    // Contador para lecturas válidas
+const int LECTURAS_REQUERIDAS = 2; // Número mínimo de lecturas consistentes
+
+VL53L0X sensorLaser;        // Objeto para manejar el sensor láser
+
+void setup() {
+  Serial.begin(9600);       // Inicializa comunicación serial a 9600 baudios
+
+  // Configura los pines como entrada o salida
+  pinMode(TRIG_IZQ, OUTPUT);
+  pinMode(ECHO_IZQ, INPUT);
+  pinMode(TRIG_DER, OUTPUT);
+  pinMode(ECHO_DER, INPUT);
+  pinMode(VIBRADOR_IZQ, OUTPUT);
+  pinMode(VIBRADOR_DER, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  Wire.begin();             // Inicia comunicación I2C
+  if (sensorLaser.init()) {
+    Serial.println("Sensor láser inicializado correctamente");
+  } else {
+    Serial.println("ERROR: Sensor láser no detectado");
+  }
+
+  sensorLaser.setTimeout(500); // Tiempo máximo de espera para lectura láser
+
+  // Apaga todos los actuadores al inicio
+  digitalWrite(VIBRADOR_IZQ, LOW);
+  digitalWrite(VIBRADOR_DER, LOW);
+  noTone(BUZZER);
+
+  Serial.println("Sistema inicializado - Con filtros mejorados");
+}
+
+void loop() {
+  leerSensores();       // Lee los sensores
+  procesarAlertas();    // Procesa las alertas según las distancias
+  delay(100);           // Espera 100 ms antes de repetir
+}
+
+int medirUltrasonido(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);          // Limpia el pulso
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);         // Envía pulso de 10 µs
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duracion = pulseIn(echoPin, HIGH, 30000); // Mide duración del eco
+  int distancia = duracion * 0.034 / 2;          // Convierte a cm
+
+  // Filtra lecturas inválidas
+  if (duracion == 0 || distancia < DISTANCIA_MINIMA_VALIDA || distancia > DISTANCIA_MAXIMA_VALIDA) {
+    return 999; // Valor especial para indicar error
+  }
+
+  return distancia;
+}
+
+bool esDistanciaValida(int distancia) {
+  return (distancia >= DISTANCIA_MINIMA_VALIDA && distancia <= DISTANCIA_MAXIMA_VALIDA);
+}
+
+void leerSensores() {
+  // Lecturas dobles para filtrar errores
+  int lecturaIzq1 = medirUltrasonido(TRIG_IZQ, ECHO_IZQ);
+  delay(5);
+  int lecturaIzq2 = medirUltrasonido(TRIG_IZQ, ECHO_IZQ);
+
+  int lecturaDer1 = medirUltrasonido(TRIG_DER, ECHO_DER);
+  delay(5);
+  int lecturaDer2 = medirUltrasonido(TRIG_DER, ECHO_DER);
+
+  // Promedio si las lecturas son consistentes
+  if (abs(lecturaIzq1 - lecturaIzq2) < 20) {
+    distanciaIzq = (lecturaIzq1 + lecturaIzq2) / 2;
+  } else {
+    distanciaIzq = 999;
+  }
+
+  if (abs(lecturaDer1 - lecturaDer2) < 20) {
+    distanciaDer = (lecturaDer1 + lecturaDer2) / 2;
+  } else {
+    distanciaDer = 999;
+  }
+
+  // Lectura del sensor láser (en mm → convertido a cm)
+  distanciaFrontal = sensorLaser.readRangeSingleMillimeters() / 10;
+  if (sensorLaser.timeoutOccurred() || distanciaFrontal < DISTANCIA_MINIMA_VALIDA || distanciaFrontal > DISTANCIA_MAXIMA_VALIDA) {
+    distanciaFrontal = 999;
+  }
+
+  // Imprime las distancias para depuración
+  Serial.print("IZQ: ");
+  Serial.print(distanciaIzq);
+  Serial.print(" cm | DER: ");
+  Serial.print(distanciaDer);
+  Serial.print(" cm | Front: ");
+  Serial.print(distanciaFrontal);
+  Serial.println(" cm");
+}
+
+void procesarAlertas() {
+  bool peligroInminente = false;
+  bool alertaFrontal = false;
+
+  // Apaga todos los actuadores antes de evaluar
+  digitalWrite(VIBRADOR_IZQ, LOW);
+  digitalWrite(VIBRADOR_DER, LOW);
+  noTone(BUZZER);
+
+  // Sensor izquierdo
+  if (esDistanciaValida(distanciaIzq)) {
+    if (distanciaIzq <= UMBRAL_PELIGRO) {
+      digitalWrite(VIBRADOR_IZQ, HIGH);
+      peligroInminente = true;
+      Serial.println("¡PELIGRO IZQUIERDO!");
+    } else if (distanciaIzq <= UMBRAL_ALERTA_MEDIA) {
+      digitalWrite(VIBRADOR_IZQ, (millis() % 400) < 200); // Vibración intermitente
+    } else if (distanciaIzq <= UMBRAL_ALERTA_SUAVE) {
+      digitalWrite(VIBRADOR_IZQ, (millis() % 800) < 100);
+    }
+  }
+
+  // Sensor derecho
+  if (esDistanciaValida(distanciaDer)) {
+    if (distanciaDer <= UMBRAL_PELIGRO) {
+      digitalWrite(VIBRADOR_DER, HIGH);
+      peligroInminente = true;
+      Serial.println("¡PELIGRO DERECHO!");
+    } else if (distanciaDer <= UMBRAL_ALERTA_MEDIA) {
+      digitalWrite(VIBRADOR_DER, (millis() % 400) < 200);
+    } else if (distanciaDer <= UMBRAL_ALERTA_SUAVE) {
+      digitalWrite(VIBRADOR_DER, (millis() % 800) < 100);
+    }
+  }
+
+// PROCESAR SENSOR FRONTAL solo si la lectura es válida
+if (esDistanciaValida(distanciaFrontal)) {
+
+  // Si la distancia frontal indica peligro (menor o igual al umbral crítico)
+  if (distanciaFrontal <= UMBRAL_PELIGRO) {
+    peligroInminente = true;                      // Se activa la bandera de peligro
+    alertaFrontal = true;                         // Se activa la bandera de alerta frontal
+    Serial.println("¡PELIGRO FRONTAL!");          // Mensaje de advertencia en consola
+    digitalWrite(VIBRADOR_IZQ, HIGH);             // Activa vibrador izquierdo
+    digitalWrite(VIBRADOR_DER, HIGH);             // Activa vibrador derecho
+  }
+
+  // Si la distancia está en el rango de alerta media
+  else if (distanciaFrontal <= UMBRAL_ALERTA_MEDIA) {
+    alertaFrontal = true;                         // Se activa la bandera de alerta frontal
+    Serial.println("Alerta frontal media");       // Mensaje informativo en consola
+    digitalWrite(VIBRADOR_IZQ, (millis() % 300) < 150); // Vibrador izquierdo intermitente
+    digitalWrite(VIBRADOR_DER, (millis() % 300) >= 150); // Vibrador derecho intermitente alternado
+  }
+
+  // Si la distancia está en el rango de alerta suave
+  else if (distanciaFrontal <= UMBRAL_ALERTA_SUAVE) {
+    alertaFrontal = true;                         // Se activa la bandera de alerta frontal
+    digitalWrite(VIBRADOR_IZQ, (millis() % 1000) < 50);  // Vibrador izquierdo con pulsos breves
+    digitalWrite(VIBRADOR_DER, (millis() % 1000) < 50);  // Vibrador derecho con pulsos breves
+  }
+
+  // DETECCIÓN DE HUECOS: si la distancia es muy grande, podría ser un vacío o escalón
+  if (distanciaFrontal > 150) {
+    Serial.println("Posible hueco detectado");    // Mensaje de advertencia en consola
+    digitalWrite(VIBRADOR_IZQ, (millis() % 200) < 100);  // Vibrador izquierdo alternado
+    digitalWrite(VIBRADOR_DER, (millis() % 200) >= 100); // Vibrador derecho alternado
+    tone(BUZZER, 800, 100);                       // Emite tono suave en buzzer
+  }
+}
+
+// ACTIVAR BUZZER solo si hay peligro real o alerta frontal
+if (peligroInminente) {
+  tone(BUZZER, 1500, 300);                        // Tono fuerte si hay peligro
+} else if (alertaFrontal) {
+  tone(BUZZER, 600, 100);                         // Tono suave si hay alerta frontal
+}
+
+// VERIFICACIÓN FINAL: Si no hay lecturas válidas, apagar todo
+if (!esDistanciaValida(distanciaIzq) &&
+    !esDistanciaValida(distanciaDer) &&
+    !esDistanciaValida(distanciaFrontal)) {
+  digitalWrite(VIBRADOR_IZQ, LOW);                // Apaga vibrador izquierdo
+  digitalWrite(VIBRADOR_DER, LOW);                // Apaga vibrador derecho
+  noTone(BUZZER);                                 // Apaga buzzer
+}
